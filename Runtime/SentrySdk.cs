@@ -1,7 +1,4 @@
 using System;
-#if UNITY_5
-using System.Collections;
-#endif
 using System.Collections.Generic;
 using System.Text;
 using UnityEngine;
@@ -34,36 +31,91 @@ public class SentrySdk : MonoBehaviour
 
     private static SentrySdk _instance = null;
 
-    public void Start()
+    public static void Init()
     {
-        if (Dsn == string.Empty)
+        UnityEngine.Debug.Log("SentrySdk.Init Start");
+        var sentryTxtAsset = Resources.Load<TextAsset>("Sentry");
+        if (sentryTxtAsset == null)
+            return;
+
+        var sentryTxt = sentryTxtAsset.text.Trim();
+        if (string.IsNullOrEmpty(sentryTxt))
+            return;
+
+        var lines = sentryTxt.Split('\n');
+        if (lines.Length < 1)
+            return;
+
+        var config_Dsn = string.Empty;
+        var config_Pii = false;
+        var config_Breadcrumb = false;
+        var config_Debug = false;
+
+        foreach (var line in lines)
         {
-            // Empty string = disabled SDK
-            UnityDebug.LogWarning("No DSN defined. The Sentry SDK will be disabled.");
+            var keyVal = line.Split('=');
+            if (keyVal.Length != 2)
+                continue;
+
+            var key = keyVal[0].Trim();
+            var val = keyVal[1].Trim();
+
+            switch (key)
+            {
+                case "Dsn":
+                    config_Dsn = val;
+                    break;
+                case "Pii":
+                    if (!bool.TryParse(val, out config_Pii))
+                        config_Pii = false;
+                    break;
+                case "Breadcrumb":
+                    if (!bool.TryParse(val, out config_Breadcrumb))
+                        config_Breadcrumb = false;
+                    break;
+                case "Debug":
+                    if (!bool.TryParse(val, out config_Debug))
+                        config_Debug = false;
+                    break;
+            }
+        }
+
+        if (string.IsNullOrEmpty(config_Dsn))
+            return;
+
+        Dsn dsn = null;
+        try
+        {
+            dsn = new Dsn(config_Dsn);
+        }
+        catch (Exception e)
+        {
+            UnityDebug.LogError("Cannot parse DSN: " + e.Message);
             return;
         }
 
         if (_instance == null)
         {
-            try
-            {
-                _dsn = new Dsn(Dsn);
-            }
-            catch (Exception e)
-            {
-                UnityDebug.LogError(string.Format("Error parsing DSN: {0}", e.Message));
-                return;
-            }
+            var go = new GameObject("SentrySdk");
+            _instance = go.AddComponent<SentrySdk>();
+            DontDestroyOnLoad(go);
+        }
 
-            _breadcrumbs = new Breadcrumb[Breadcrumb.MaxBreadcrumbs];
-            DontDestroyOnLoad(this);
-            _instance = this;
-            _initialized = true;
-        }
-        else
-        {
-            Destroy(this);
-        }
+        _instance.Init(dsn, config_Dsn, config_Pii, config_Breadcrumb, config_Debug);
+    }
+
+    public void Init(Dsn dsn, string dsnStr, bool pii, bool breadcrumb, bool debug)
+    {
+        _dsn = dsn;
+        Dsn = dsnStr;
+        SendDefaultPii = pii;
+        AutoGenerateBreadcrumb = breadcrumb;
+        Debug = debug;
+
+        _breadcrumbs = new Breadcrumb[Breadcrumb.MaxBreadcrumbs];
+        _initialized = true;
+
+        UnityEngine.Debug.Log("SentrySdk.Init End");
     }
 
     public static void AddBreadcrumb(string message)
@@ -339,12 +391,8 @@ public class SentrySdk : MonoBehaviour
         @event.extra.screenOrientation = Screen.orientation.ToString();
     }
 
-    private IEnumerator
-#if !UNITY_5
-        <UnityWebRequestAsyncOperation>
-#endif
-        ContinueSendingEvent<T>(T @event)
-            where T : SentryEvent
+    private StringBuilder _stringBuilder = new StringBuilder();
+    private IEnumerator<UnityWebRequestAsyncOperation> ContinueSendingEvent<T>(T @event) where T : SentryEvent
     {
         PrepareEvent(@event);
 
@@ -353,37 +401,29 @@ public class SentrySdk : MonoBehaviour
         var sentryKey = _dsn.publicKey;
         var sentrySecret = _dsn.secretKey;
 
-        var timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH\\:mm\\:ss");
-        var authString = string.Format("Sentry sentry_version=5,sentry_client=Unity0.1," +
-                 "sentry_timestamp={0}," +
-                 "sentry_key={1}," +
-                 "sentry_secret={2}",
-                 timestamp,
-                 sentryKey,
-                 sentrySecret);
+        _stringBuilder.Clear();
+        _stringBuilder.Append("Sentry sentry_version=5,sentry_client=Unity0.1,");
+        _stringBuilder.Append("sentry_timestamp=");
+        _stringBuilder.Append(DateTime.UtcNow.ToString("yyyy-MM-ddTHH\\:mm\\:ss"));
+        _stringBuilder.Append(",sentry_key=");
+        _stringBuilder.Append(sentryKey);
+        _stringBuilder.Append(",sentry_secret=");
+        _stringBuilder.Append(sentrySecret);
 
         var www = new UnityWebRequest(_dsn.callUri.ToString());
         www.method = "POST";
-        www.SetRequestHeader("X-Sentry-Auth", authString);
+        www.SetRequestHeader("X-Sentry-Auth", _stringBuilder.ToString());
         www.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(s));
         www.downloadHandler = new DownloadHandlerBuffer();
-#if UNITY_5
-        yield return www.Send();
-#else
         yield return www.SendWebRequest();
-#endif
 
         while (!www.isDone)
         {
             yield return null;
         }
-        if (
-#if UNITY_5
-            www.isError
-#else
-            www.isNetworkError || www.isHttpError
-#endif
-             || www.responseCode != 200)
+        if (www.result == UnityWebRequest.Result.ConnectionError
+            || www.result == UnityWebRequest.Result.ProtocolError
+            || www.responseCode != 200)
         {
             UnityDebug.LogWarning("error sending request to sentry: " + www.error);
         }
